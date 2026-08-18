@@ -1,0 +1,11 @@
+.env
+*.mypy_cache
+venv
+Lyzr*
+payload.json
+results_op*
+track*
+harness-old*
+clean.py
+results*
+__pycache__

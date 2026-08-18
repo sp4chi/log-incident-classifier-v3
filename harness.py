@@ -1,0 +1,752 @@
+"""
+Track A benchmark harness — Auto-Remediation from Logs.
+
+Runs TWO passes over track_a_logs.xlsx and prints a results table:
+  1. NAIVE baseline   — one LLM call per raw row (455 calls), no dedup.
+  2. OPTIMIZED build  — dedup to unique messages first (16 calls), route
+                         noise for free, only classify real candidates,
+                         then fan the verdict back out to all 455 rows.
+
+Usage:
+    Put LYZR_API_KEY / LYZR_AGENT_ID / LYZR_USER_ID in a .env file, or
+    export them directly.
+    python harness.py --data track_a_logs.xlsx --mode both
+
+Design notes (read before you run this against real money):
+  - This script does NOT hardcode which messages are noise. That would be
+    cheating the benchmark. Both passes call the real agent and let IT
+    decide is_incident. The only thing dedup skips is calling the model
+    twice on an identical string.
+  - CONFIDENCE_THRESHOLD below is the human-review gate. Change it here
+    to test the moving-target scenarios.
+  - Token/cost accounting: CONFIRMED via a live curl test that Lyzr's
+    /v3/inference/chat/ response is just {"response": "...",
+    "module_outputs": {}} — no usage/token block at all. So every cost
+    and token number this script reports is a LOCAL ESTIMATE (tiktoken
+    if installed, else a word-count heuristic), not a number Lyzr
+    reported. This is fine for showing the *relative* delta between
+    naive and optimized (16 calls vs 455 calls is true regardless of
+    how you count tokens), but say "estimated" out loud when you present
+    the actual dollar figures — don't imply Lyzr gave you a metered
+    number it didn't.
+  - NO response_format / JSON-schema enforcement: removed after a real
+    production incident where Lyzr's platform silently auto-fell-back
+    from openai/gpt-4o-mini to a Groq model (llama-3.1-8b-instant)
+    mid-request, and that model's structured-output implementation
+    (a tool-calling workaround in litellm) is incompatible with how
+    Lyzr's routing layer passes a JSON schema through — every call
+    failed with a 400 during a real batch run. The closed-set contract
+    is now enforced ONLY by: (1) prompt instructions, (2) this script's
+    own validation against ALLOWED_CATEGORIES/ALLOWED_ROOT_CAUSES/
+    ALLOWED_REMEDIATIONS, and (3) deterministic category derivation from
+    root_cause. This is a SOFTER guarantee than schema enforcement —
+    state that plainly, don't imply it's equivalent.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import time
+import statistics
+import sys
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+import httpx
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Config — edit these or pass as env vars / CLI args
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+LYZR_BASE_URL = os.environ.get("LYZR_BASE_URL", "https://agent-prod.studio.lyzr.ai")
+LYZR_API_KEY = os.environ.get("LYZR_API_KEY", "")
+LYZR_AGENT_ID = os.environ.get("LYZR_AGENT_ID", "")
+LYZR_USER_ID = os.environ.get("LYZR_USER_ID", "")  # required by /v3/inference/chat/
+
+CONFIDENCE_THRESHOLD = 0.6  # below this -> flagged for human review
+
+# Estimated token count of the fixed system prompt that every real call
+# pays on top of the actual log message.
+#
+# *** STALE — RECALIBRATE BEFORE TRUSTING COST NUMBERS ***
+# This value (3944) was calibrated against an EARLIER, SHORTER version of
+# lyzr_agent_config.json. Since then, agent_instructions grew (added an
+# explicit ROOT CAUSE TO CATEGORY MAPPING block + a 4th few-shot example
+# for NullPointerException), which adds real tokens to every call's fixed
+# overhead. Run `python harness.py --mode calibrate` against the CURRENT
+# agent with a real message, get the real llm_input_tokens from the
+# traces dashboard, and update this constant before trusting any
+# cost/token figures in the results table — right now they're a measured
+# UNDERESTIMATE relative to the actual current prompt size.
+PROMPT_OVERHEAD_TOKENS = 3843
+
+# Pricing calibrated from REAL measured traces (not list-price guesses).
+# Solved as a linear system from 2 real gpt-5-mini traces (memory disabled):
+#   Call 1: "Hi"        → 3844 in / 348 out  → 0.017 credits
+#   Call 2: postgres msg → 3863 in / 466 out  → 0.019 credits
+# System: a*3844 + b*348 = 0.017
+#         a*3863 + b*466 = 0.019
+# Solution: a=0.0000029, b=0.0000165  (verified within ~0.5% on both points)
+# Note: old constants (0.000149 / 0.000682) were 41-51x too high because
+# they were calibrated against the memory-ENABLED agent and absorbed the
+# full memory-pipeline credit overhead into the per-token rates.
+CREDITS_PER_INPUT_TOKEN = 0.0000029
+CREDITS_PER_OUTPUT_TOKEN = 0.0000165
+# Lyzr's published self-serve rate is ~$10 per 1,000 credits. Not
+# independently confirmed against this specific account's exact billing
+# tier -- check the account's billing page before quoting exact dollar
+# figures as final.
+USD_PER_CREDIT = 0.01
+
+ALLOWED_CATEGORIES = {
+    "capacity", "dependency_failure", "resource_exhaustion",
+    "code_defect", "performance", "config_error",
+}
+ALLOWED_ROOT_CAUSES = {
+    "rate_limit_breach", "db_connection_pool_exhausted", "disk_full",
+    "consumer_lag", "upstream_outage", "db_deadlock", "null_pointer",
+    "missing_index", "memory_leak", "expired_cert",
+}
+ALLOWED_REMEDIATIONS = {
+    "add_backpressure_and_request_quota_increase",
+    "increase_pool_size_and_add_timeout_retry",
+    "rotate_logs_and_expand_volume",
+    "scale_consumers_and_check_poison_message",
+    "enable_fallback_queue_and_alert_vendor",
+    "reorder_locks_and_add_retry_with_backoff",
+    "ship_hotfix_null_guard",
+    "add_index_and_review_query_plan",
+    "restart_pod_and_raise_heap_limit",
+    "rotate_certificate_and_add_expiry_alert",
+}
+
+# root_cause -> category is a FIXED, fully-determined mapping in this
+# dataset (confirmed against all 40 labeled ground-truth rows). The
+# agent's instructions now ALSO include this table explicitly (belt and
+# suspenders with the prompt itself), but this deterministic override
+# remains the hard guarantee — root_cause scores far more reliably than
+# the model's own category field, so we trust the fixed mapping over
+# whatever category the model returns, regardless of what the prompt
+# says. Don't ask an LLM to reproduce a deterministic function you can
+# just compute.
+ROOT_CAUSE_TO_CATEGORY = {
+    "rate_limit_breach": "capacity",
+    "db_connection_pool_exhausted": "dependency_failure",
+    "disk_full": "resource_exhaustion",
+    "consumer_lag": "capacity",
+    "upstream_outage": "dependency_failure",
+    "db_deadlock": "code_defect",
+    "null_pointer": "code_defect",
+    "missing_index": "performance",
+    "memory_leak": "resource_exhaustion",
+    "expired_cert": "config_error",
+}
+
+try:
+    import tiktoken
+    _ENC = tiktoken.get_encoding("cl100k_base")
+    def _estimate_tokens(text: str) -> int:
+        return len(_ENC.encode(text))
+except ImportError:
+    def _estimate_tokens(text: str) -> int:
+        # crude fallback: ~1.3 tokens per word, good enough for a rough
+        # estimate flag — real accounting should come from the API's
+        # own usage block whenever available.
+        return int(len(text.split()) * 1.3)
+
+
+@dataclass
+class CallResult:
+    event_id: str
+    message: str
+    is_incident: bool | None = None
+    category: str | None = None
+    root_cause: str | None = None
+    remediation: str | None = None
+    confidence: float | None = None
+    reasoning: str = ""
+    needs_human_review: bool = False
+    schema_valid: bool = True
+    error: str | None = None
+    latency_s: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    tokens_estimated: bool = False
+    cost_usd: float = 0.0
+    is_actual_call: bool = True  # False for fanned-out duplicates that
+                                  # reused another row's verdict for free
+    category_overridden: bool = False  # True if the model's raw category
+                                        # disagreed with the deterministic
+                                        # root_cause->category mapping and
+                                        # we corrected it
+
+
+# ---------------------------------------------------------------------------
+# Lyzr API call
+# ---------------------------------------------------------------------------
+
+async def call_lyzr_agent(service: str, severity: str, message: str,
+                           session_id: str, client: httpx.AsyncClient,
+                           retries: int = 3) -> CallResult:
+    """
+    Async version: calls the Lyzr inference endpoint for a single log line,
+    with retries on transient failure. Uses a shared httpx.AsyncClient for
+    connection-pool reuse across concurrent calls — one client per batch run,
+    not one per call. Idempotent: session_id is deterministic per event so a
+    retried call doesn't create duplicate state on Lyzr's side.
+
+    asyncio vs threads: this is an I/O-bound workload (~7s/call in network
+    wait). asyncio coroutines are cheaper than OS threads at high concurrency
+    — no kernel context-switch overhead, no per-thread stack allocation, no
+    threading.Lock on shared state. The bottleneck at production scale is the
+    provider's RPM quota, not the client's concurrency mechanism — but asyncio
+    is the architecturally correct choice once you want hundreds of concurrent
+    in-flight calls without thread overhead.
+    """
+    result = CallResult(event_id=session_id, message=message)
+
+    user_message = (
+        f"service={service} severity={severity} message=\"{message}\""
+    )
+
+    payload = {
+        "user_id": LYZR_USER_ID,
+        "agent_id": LYZR_AGENT_ID,
+        "session_id": session_id,
+        "message": user_message,
+    }
+    headers = {
+        "x-api-key": LYZR_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    last_err = None
+    for attempt in range(retries):
+        start = time.perf_counter()
+        try:
+            resp = await client.post(
+                f"{LYZR_BASE_URL}/v3/inference/chat/",
+                headers=headers,
+                json=payload,
+            )
+            elapsed = time.perf_counter() - start
+            resp.raise_for_status()
+            data = resp.json()
+            result.latency_s = elapsed
+
+            raw_text = data.get("response") or data.get("agent_response") or ""
+
+            # Confirmed via live testing: Lyzr's /v3/inference/chat/
+            # response is {"response": "...", "module_outputs": {}} —
+            # no token usage block. So this is ALWAYS an estimate, not
+            # a fallback for a rare missing case. We still check for a
+            # usage block in case a future API version or a different
+            # account tier adds one, but assume it won't be there.
+            usage = data.get("usage") or {}
+            if usage:
+                result.prompt_tokens = usage.get("prompt_tokens", 0)
+                result.completion_tokens = usage.get("completion_tokens", 0)
+            else:
+                result.prompt_tokens = _estimate_tokens(user_message) + PROMPT_OVERHEAD_TOKENS
+                result.completion_tokens = _estimate_tokens(str(raw_text))
+                result.tokens_estimated = True
+
+            result.cost_usd = (
+                result.prompt_tokens * CREDITS_PER_INPUT_TOKEN
+                + result.completion_tokens * CREDITS_PER_OUTPUT_TOKEN
+            ) * USD_PER_CREDIT
+
+            _parse_verdict(raw_text, result)
+            return result
+
+        except Exception as e:  # noqa: BLE001 - want to retry on anything transient
+            last_err = str(e)
+            if attempt < retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 8))  # non-blocking backoff
+                continue
+
+    result.error = f"failed after {retries} attempts: {last_err}"
+    result.needs_human_review = True
+    result.schema_valid = False
+    return result
+
+
+def _parse_verdict(raw_text: str, result: CallResult) -> None:
+    """Parses + validates the model's JSON output against the closed-set
+    contract. This is the ONLY enforcement mechanism now — there is no
+    platform-level response_format/JSON-schema (removed after a real
+    Lyzr/Groq fallback incompatibility broke every call, see module
+    docstring). Without schema enforcement, defensive parsing matters
+    MORE, not less: the model may still wrap output in markdown fences
+    or add stray prose despite being told not to."""
+    if isinstance(raw_text, str):
+        text = raw_text.strip()
+        # Try a fenced ```json ... ``` or ``` ... ``` block first.
+        fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1)
+        else:
+            # Fallback: grab the outermost {...} span, in case there's
+            # stray prose before/after the JSON (e.g. "Sure, here you
+            # go:\n{...}") that a simple startswith("```") check would
+            # miss entirely.
+            brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+            if brace_match:
+                text = brace_match.group(0)
+    else:
+        text = raw_text
+
+    try:
+        verdict = json.loads(text) if isinstance(text, str) else text
+    except (json.JSONDecodeError, TypeError):
+        result.error = "could not parse JSON from model output"
+        result.needs_human_review = True
+        result.schema_valid = False
+        return
+
+    result.is_incident = verdict.get("is_incident")
+    result.category = verdict.get("category")
+    result.root_cause = verdict.get("root_cause")
+    result.remediation = verdict.get("remediation")
+    result.confidence = verdict.get("confidence")
+    result.reasoning = verdict.get("reasoning", "")
+
+    # Closed-set validation — this is what "0 free-form remediations"
+    # actually means in code, not just in the prompt. This is now the
+    # PRIMARY guardrail (no schema backstop), so it matters more than
+    # it used to.
+    if result.category is not None and result.category not in ALLOWED_CATEGORIES:
+        result.schema_valid = False
+    if result.root_cause is not None and result.root_cause not in ALLOWED_ROOT_CAUSES:
+        result.schema_valid = False
+    if result.remediation is not None and result.remediation not in ALLOWED_REMEDIATIONS:
+        result.schema_valid = False
+
+    # Deterministic category correction: root_cause fully determines
+    # category in this dataset (see ROOT_CAUSE_TO_CATEGORY above), and
+    # root_cause scores far more reliably than the model's own category
+    # field. If root_cause is a known, valid value, trust the fixed
+    # mapping over whatever category the model returned — this doesn't
+    # touch is_incident=False (noise) rows, where category correctly
+    # stays null.
+    if result.root_cause in ROOT_CAUSE_TO_CATEGORY:
+        derived_category = ROOT_CAUSE_TO_CATEGORY[result.root_cause]
+        if result.category != derived_category:
+            result.category_overridden = True
+            result.reasoning += (
+                f" [category corrected: model said '{result.category}', "
+                f"derived '{derived_category}' from root_cause]"
+            )
+            result.category = derived_category
+
+    if not result.schema_valid:
+        result.needs_human_review = True
+        result.reasoning += " [FLAGGED: output failed closed-set validation]"
+
+    if result.confidence is None or result.confidence < CONFIDENCE_THRESHOLD:
+        result.needs_human_review = True
+
+
+# ---------------------------------------------------------------------------
+# Passes
+# ---------------------------------------------------------------------------
+
+# Bounded concurrency via asyncio.Semaphore — limits how many coroutines
+# are inside the awaited HTTP call at once. asyncio is single-threaded so
+# there is no threading.Lock on the shared counter or progress print: the
+# event loop guarantees that only one coroutine runs at a time between
+# await points, eliminating the race condition by construction.
+# This knob scales cheaply: asyncio tasks are coroutine objects, not OS
+# threads — you can raise MAX_TASK to hundreds with negligible overhead.
+# The real ceiling at production scale is the provider's RPM quota.
+MAX_TASK = 8
+
+
+async def run_naive_baseline(df: pd.DataFrame) -> tuple[list[CallResult], float]:
+    """One call per raw row. No dedup, no cheap-path routing. This is the
+    'biggest sensible naive thing' the assignment wants as a comparison
+    point — it is intentionally wasteful.
+
+    Runs with bounded asyncio concurrency (MAX_TASK semaphore) rather
+    than one call at a time. A single shared httpx.AsyncClient is used for
+    all concurrent calls — the client handles connection pooling internally,
+    so we get keep-alive and multiplexing for free without managing sockets
+    ourselves. Returns (results, wall_clock_seconds).
+    """
+    rows = list(df.iterrows())
+    total = len(rows)
+    results: list = [None] * total
+    done = 0
+    sem = asyncio.Semaphore(MAX_TASK)
+
+    async def _task(i: int, row, client: httpx.AsyncClient) -> None:
+        nonlocal done
+        async with sem:
+            r = await call_lyzr_agent(
+                row["service"], row["severity"], row["message"],
+                session_id=f"naive-{row['event_id']}",
+                client=client,
+            )
+        r.event_id = row["event_id"]
+        results[i] = r
+        done += 1  # safe without a lock: asyncio is single-threaded
+        print(f"  [naive] {done}/{total}", end="\r", file=sys.stderr)
+
+    start = time.perf_counter()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await asyncio.gather(*(
+            _task(i, row, client) for i, (_, row) in enumerate(rows)
+        ))
+    wall_clock_s = time.perf_counter() - start
+    print(file=sys.stderr)
+    return results, wall_clock_s
+
+
+async def run_optimized(df: pd.DataFrame) -> tuple[list[CallResult], dict]:
+    """Dedup to unique messages, call once per unique message (with bounded
+    asyncio concurrency), fan the verdict back out to every row sharing that
+    message. This is the single biggest cost lever for this dataset
+    (16 calls instead of 455)."""
+    unique_messages = df["message"].unique()
+    print(f"  {len(df)} rows -> {len(unique_messages)} unique messages",
+          file=sys.stderr)
+
+    # representative row per unique message, for service/severity context
+    rep_rows = df.drop_duplicates(subset="message", keep="first")
+    rep_rows_list = list(rep_rows.iterrows())
+    total = len(rep_rows_list)
+    done = 0
+    sem = asyncio.Semaphore(MAX_TASK)
+
+    async def _task(row, client: httpx.AsyncClient):
+        nonlocal done
+        async with sem:
+            r = await call_lyzr_agent(
+                row["service"], row["severity"], row["message"],
+                session_id=f"opt-{row['event_id']}",
+                client=client,
+            )
+        done += 1  # safe without a lock: asyncio is single-threaded
+        print(f"  [optimized] {done}/{total}", end="\r", file=sys.stderr)
+        return row["message"], r
+
+    start = time.perf_counter()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        pairs = await asyncio.gather(*(
+            _task(row, client) for _, row in rep_rows_list
+        ))
+    wall_clock_s = time.perf_counter() - start
+    print(file=sys.stderr)
+
+    verdict_by_message: dict[str, CallResult] = dict(pairs)
+
+    # fan out: every row gets its message's verdict, but only the ONE
+    # representative row per unique message actually made an API call.
+    # Every other row is a free dict lookup — zero extra tokens, zero
+    # extra latency, zero extra cost. This is the entire point of dedup,
+    # so we must not let those rows carry the representative's cost/
+    # latency numbers into the aggregate metrics, or the optimized build
+    # would look MORE expensive than naive (455 rows worth of "cost")
+    # instead of less.
+    seen_messages = set()
+    fanned_results = []
+    for _, row in df.iterrows():
+        base = verdict_by_message[row["message"]]
+        is_first_occurrence = row["message"] not in seen_messages
+        seen_messages.add(row["message"])
+
+        fields = dict(base.__dict__)
+        fields["event_id"] = row["event_id"]
+        if not is_first_occurrence:
+            fields["is_actual_call"] = False
+            fields["latency_s"] = 0.0
+            fields["prompt_tokens"] = 0
+            fields["completion_tokens"] = 0
+            fields["cost_usd"] = 0.0
+        fanned_results.append(CallResult(**fields))
+
+    dedup_stats = {
+        "raw_rows": len(df),
+        "unique_messages": len(unique_messages),
+        "llm_calls_made": len(rep_rows),
+        "calls_saved_by_dedup": len(df) - len(rep_rows),
+        "wall_clock_s": wall_clock_s,
+    }
+    return fanned_results, dedup_stats
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def compute_metrics(results: list[CallResult], df: pd.DataFrame,
+                     wall_clock_s: float | None = None) -> dict:
+    by_id = {r.event_id: r for r in results}
+    labeled = df[df["is_labeled"] == "yes"]
+
+    all_messages = set(df["message"].unique())
+    incident_messages = set(labeled["message"].unique())
+    noise_messages = all_messages - incident_messages
+
+    y_true_cat, y_pred_cat = [], []
+    y_true_root, y_pred_root = [], []
+    free_form_remediations = 0
+    fabricated_or_invalid = 0
+    false_escalations = 0
+
+    for _, row in labeled.iterrows():
+        r = by_id.get(row["event_id"])
+        if r is None:
+            continue
+        y_true_cat.append(str(row["gt_category"]))
+        pred_cat = r.category if r.schema_valid else "INVALID"
+        y_pred_cat.append(str(pred_cat) if pred_cat is not None else "NONE_PREDICTED")
+
+        y_true_root.append(str(row["gt_root_cause"]))
+        pred_root = r.root_cause if r.schema_valid else "INVALID"
+        y_pred_root.append(str(pred_root) if pred_root is not None else "NONE_PREDICTED")
+
+    seen_noise_messages = set()
+    for r in results:
+        if r.remediation is not None and r.remediation not in ALLOWED_REMEDIATIONS:
+            free_form_remediations += 1
+        if not r.schema_valid:
+            fabricated_or_invalid += 1
+        if r.message in noise_messages and r.message not in seen_noise_messages:
+            seen_noise_messages.add(r.message)
+            if r.is_incident is True:
+                false_escalations += 1
+
+    try:
+        from sklearn.metrics import f1_score
+        cat_f1 = f1_score(y_true_cat, y_pred_cat, average="macro", zero_division=0)
+        root_f1 = f1_score(y_true_root, y_pred_root, average="macro", zero_division=0)
+    except ImportError:
+        cat_f1 = _manual_macro_f1(y_true_cat, y_pred_cat)
+        root_f1 = _manual_macro_f1(y_true_root, y_pred_root)
+
+    actual_calls = [r for r in results if r.is_actual_call]
+    latencies = [r.latency_s for r in actual_calls if r.latency_s > 0]
+    n_calls = len(actual_calls)
+
+    p50 = statistics.median(latencies) if latencies else 0.0
+    p95 = _percentile(latencies, 95) if latencies else 0.0
+
+    total_cost = sum(r.cost_usd for r in actual_calls)
+    total_tokens = sum(r.prompt_tokens + r.completion_tokens for r in actual_calls)
+
+    if wall_clock_s and wall_clock_s > 0:
+        throughput = round(len(results) / (wall_clock_s / 60), 2)
+    elif latencies:
+        throughput = round(len(results) / (sum(latencies) / 60), 2)
+    else:
+        throughput = 0
+
+    return {
+        "category_macro_f1": round(cat_f1, 4),
+        "root_cause_macro_f1": round(root_f1, 4),
+        "free_form_remediation_count": free_form_remediations,
+        "invalid_schema_count": fabricated_or_invalid,
+        "false_escalation_count": false_escalations,
+        "false_escalation_rate": round(false_escalations / max(len(noise_messages), 1), 4),
+        "category_overridden_count": sum(1 for r in actual_calls if r.category_overridden),
+        "human_review_flagged": sum(1 for r in results if r.needs_human_review),
+        "actual_llm_calls": n_calls,
+        "rows_covered": len(results),
+        "p50_latency_s": round(p50, 3),
+        "p95_latency_s": round(p95, 3),
+        "total_tokens": total_tokens,
+        "avg_tokens_per_call": round(total_tokens / max(n_calls, 1), 1),
+        "total_cost_usd": round(total_cost, 4),
+        "cost_per_task_usd": round(total_cost / max(len(results), 1), 6),
+        "wall_clock_s": round(wall_clock_s, 2) if wall_clock_s else None,
+        "throughput_tasks_per_min": throughput,
+        "any_estimated_tokens": any(r.tokens_estimated for r in results),
+    }
+
+
+def _percentile(data: list[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    s = sorted(data)
+    k = (len(s) - 1) * (pct / 100)
+    f, c = int(k), min(int(k) + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _manual_macro_f1(y_true, y_pred) -> float:
+    labels = set(y_true) | set(y_pred)
+    f1s = []
+    for lbl in labels:
+        tp = sum(1 for t, p in zip(y_true, y_pred) if t == lbl and p == lbl)
+        fp = sum(1 for t, p in zip(y_true, y_pred) if t != lbl and p == lbl)
+        fn = sum(1 for t, p in zip(y_true, y_pred) if t == lbl and p != lbl)
+        prec = tp / (tp + fp) if (tp + fp) else 0
+        rec = tp / (tp + fn) if (tp + fn) else 0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
+        f1s.append(f1)
+    return sum(f1s) / len(f1s) if f1s else 0.0
+
+
+def print_results_table(naive: dict, optimized: dict, dedup_stats: dict):
+    def delta(a, b, higher_is_better=True):
+        if a == 0:
+            return "n/a"
+        d = (b - a) / a * 100
+        arrow = "↑" if d > 0 else "↓"
+        return f"{arrow}{abs(d):.1f}%"
+
+    print("\n" + "=" * 78)
+    print("RESULTS TABLE — Track A: Auto-Remediation from Logs")
+    print("=" * 78)
+    print(f"Raw rows: {dedup_stats['raw_rows']}  |  Unique messages: "
+          f"{dedup_stats['unique_messages']}  |  Optimized LLM calls: "
+          f"{dedup_stats['llm_calls_made']}  |  Calls saved by dedup: "
+          f"{dedup_stats['calls_saved_by_dedup']}")
+    print("-" * 78)
+    rows = [
+        ("Category macro-F1", naive["category_macro_f1"], optimized["category_macro_f1"]),
+        ("Root-cause macro-F1", naive["root_cause_macro_f1"], optimized["root_cause_macro_f1"]),
+        ("Free-form remediations (want 0)", naive["free_form_remediation_count"], optimized["free_form_remediation_count"]),
+        ("False escalation rate", naive["false_escalation_rate"], optimized["false_escalation_rate"]),
+        ("Human-review flagged", naive["human_review_flagged"], optimized["human_review_flagged"]),
+        ("p50 latency (s)", naive["p50_latency_s"], optimized["p50_latency_s"]),
+        ("p95 latency (s)", naive["p95_latency_s"], optimized["p95_latency_s"]),
+        ("Total tokens", naive["total_tokens"], optimized["total_tokens"]),
+        ("Total cost (USD)", naive["total_cost_usd"], optimized["total_cost_usd"]),
+        ("Cost per task (USD)", naive["cost_per_task_usd"], optimized["cost_per_task_usd"]),
+        ("Batch wall-clock (s)", naive.get("wall_clock_s") or 0, optimized.get("wall_clock_s") or 0),
+        ("Throughput (tasks/min)", naive["throughput_tasks_per_min"], optimized["throughput_tasks_per_min"]),
+    ]
+    print(f"{'Metric':<34}{'Naive':>15}{'Optimized':>15}{'Delta':>14}")
+    print("-" * 78)
+    for name, a, b in rows:
+        d = delta(a, b) if isinstance(a, (int, float)) and a != 0 else "n/a"
+        print(f"{name:<34}{a:>15}{b:>15}{d:>14}")
+    print("=" * 78)
+    if naive.get("any_estimated_tokens") or optimized.get("any_estimated_tokens"):
+        print("NOTE: Lyzr's /v3/inference/chat/ response does not include a "
+              "token usage block (confirmed by live test) — EVERY token and "
+              "cost figure above is a local estimate, not a metered number "
+              "from the API. State this plainly when presenting these "
+              "numbers. The relative delta (naive vs optimized) is still "
+              "meaningful since both sides use the same estimation method, "
+              "but do not quote the absolute dollar figures as exact.")
+
+
+def run_calibration_check():
+    """
+    Interactive helper for validating the local token estimate against a
+    real measured trace from Lyzr's traces-v2 dashboard.
+    """
+    print("\n=== Calibration check: local estimate vs real Lyzr trace ===")
+    message = input("Paste the exact log message you sent (or 'Hi' for a "
+                     "pure-overhead test): ").strip()
+    real_input = int(input("Real llm_input_tokens (from traces-v2 dashboard): ").strip())
+    real_output = int(input("Real llm_output_tokens (from traces-v2 dashboard): ").strip())
+    real_cost_credits_raw = input("Real action_cost in credits (optional, "
+                                   "press Enter to skip): ").strip()
+
+    est_input = _estimate_tokens(message) + PROMPT_OVERHEAD_TOKENS
+    est_output = _estimate_tokens("")
+
+    input_delta_pct = (est_input - real_input) / real_input * 100 if real_input else 0
+
+    print(f"\n{'Metric':<28}{'Estimated':>12}{'Real':>12}{'Delta':>12}")
+    print("-" * 64)
+    print(f"{'Input tokens':<28}{est_input:>12}{real_input:>12}{input_delta_pct:>+11.1f}%")
+    print(f"{'Output tokens':<28}{'n/a':>12}{real_output:>12}{'n/a':>12}")
+
+    if real_cost_credits_raw:
+        real_cost_credits = float(real_cost_credits_raw)
+        real_cost_usd = real_cost_credits * USD_PER_CREDIT
+        est_cost_usd = (
+            est_input * CREDITS_PER_INPUT_TOKEN
+            + est_output * CREDITS_PER_OUTPUT_TOKEN
+        ) * USD_PER_CREDIT
+        print(f"{'Cost (USD, calibrated)':<28}{est_cost_usd:>12.5f}{real_cost_usd:>12.5f}")
+        print("\nNOTE: cost uses the CREDITS_PER_INPUT/OUTPUT_TOKEN rates "
+              "calibrated from earlier real traces. If PROMPT_OVERHEAD_TOKENS "
+              "is stale (see warning at top of file), update it based on "
+              "this real_input reading before trusting the comparison.")
+
+    print("\nIf the delta above is large, update PROMPT_OVERHEAD_TOKENS at "
+          "the top of this file to (real_input - estimated tokens for your "
+          "message text), then re-run this check to confirm it's closer.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    global MAX_TASK
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default="track_a_logs.xlsx")
+    parser.add_argument("--mode", choices=["naive", "optimized", "both", "calibrate"],
+                         default="both")
+    parser.add_argument("--out-prefix", default="results")
+    parser.add_argument("--max-tasks", type=int, default=MAX_TASK,
+                         help="Concurrency level for API calls. Lower this "
+                              "if p95 latency exceeds budget under load "
+                              "(contention increases per-call latency as "
+                              "concurrency rises) — this is a real, "
+                              "measurable throughput-vs-latency trade-off "
+                              "worth citing in the moving-target section.")
+    args = parser.parse_args()
+    MAX_TASK = args.max_workers
+
+    if args.mode == "calibrate":
+        run_calibration_check()
+        return
+
+    if not LYZR_API_KEY or not LYZR_AGENT_ID or not LYZR_USER_ID:
+        print("ERROR: set LYZR_API_KEY, LYZR_AGENT_ID, and LYZR_USER_ID "
+              "(via .env or environment) before running.", file=sys.stderr)
+        sys.exit(1)
+
+    df = pd.read_excel(args.data)
+
+    naive_metrics = optimized_metrics = None
+    dedup_stats = {"raw_rows": len(df), "unique_messages": df["message"].nunique(),
+                   "llm_calls_made": df["message"].nunique(),
+                   "calls_saved_by_dedup": len(df) - df["message"].nunique()}
+
+    if args.mode in ("naive", "both"):
+        print("Running NAIVE baseline (one call per raw row)...", file=sys.stderr)
+        naive_results, naive_wall_clock_s = asyncio.run(run_naive_baseline(df))
+        naive_metrics = compute_metrics(naive_results, df, wall_clock_s=naive_wall_clock_s)
+        pd.DataFrame([r.__dict__ for r in naive_results]).to_csv(
+            f"{args.out_prefix}_naive_raw.csv", index=False)
+
+    if args.mode in ("optimized", "both"):
+        print("Running OPTIMIZED build (dedup first)...", file=sys.stderr)
+        opt_results, dedup_stats = asyncio.run(run_optimized(df))
+        optimized_metrics = compute_metrics(
+            opt_results, df, wall_clock_s=dedup_stats.get("wall_clock_s"))
+        pd.DataFrame([r.__dict__ for r in opt_results]).to_csv(
+            f"{args.out_prefix}_optimized_raw.csv", index=False)
+
+    if naive_metrics and optimized_metrics:
+        print_results_table(naive_metrics, optimized_metrics, dedup_stats)
+        with open(f"{args.out_prefix}_summary.json", "w") as f:
+            json.dump({"naive": naive_metrics, "optimized": optimized_metrics,
+                       "dedup_stats": dedup_stats}, f, indent=2)
+        print(f"\nSaved: {args.out_prefix}_naive_raw.csv, "
+              f"{args.out_prefix}_optimized_raw.csv, "
+              f"{args.out_prefix}_summary.json")
+    elif naive_metrics:
+        print(json.dumps(naive_metrics, indent=2))
+    elif optimized_metrics:
+        print(json.dumps(optimized_metrics, indent=2))
+
+
+if __name__ == "__main__":
+    main()
