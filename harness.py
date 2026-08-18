@@ -364,7 +364,7 @@ def _parse_verdict(raw_text: str, result: CallResult) -> None:
 # This knob scales cheaply: asyncio tasks are coroutine objects, not OS
 # threads — you can raise MAX_TASK to hundreds with negligible overhead.
 # The real ceiling at production scale is the provider's RPM quota.
-MAX_TASK = 8
+MAX_TASK = 4
 
 
 async def run_naive_baseline(df: pd.DataFrame) -> tuple[list[CallResult], float]:
@@ -701,7 +701,7 @@ def main():
                               "measurable throughput-vs-latency trade-off "
                               "worth citing in the moving-target section.")
     args = parser.parse_args()
-    MAX_TASK = args.max_workers
+    MAX_TASK = args.max_tasks
 
     if args.mode == "calibrate":
         run_calibration_check()

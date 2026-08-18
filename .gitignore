@@ -2,7 +2,7 @@
 *.mypy_cache
 venv
 Lyzr*
-payload.json
+
 results_op*
 track*
 harness-old*
