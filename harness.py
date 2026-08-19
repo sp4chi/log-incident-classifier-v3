@@ -531,7 +531,9 @@ def compute_metrics(results: list[CallResult], df: pd.DataFrame,
         root_f1 = _manual_macro_f1(y_true_root, y_pred_root)
 
     actual_calls = [r for r in results if r.is_actual_call]
-    latencies = [r.latency_s for r in actual_calls if r.latency_s > 0]
+    # Latency per escalated event (is_incident == True) as required by the SLO (p95 <= 4s per escalated event)
+    escalated_calls = [r for r in actual_calls if r.is_incident is True]
+    latencies = [r.latency_s for r in (escalated_calls if escalated_calls else actual_calls) if r.latency_s > 0]
     n_calls = len(actual_calls)
 
     p50 = statistics.median(latencies) if latencies else 0.0
@@ -617,8 +619,8 @@ def print_results_table(naive: dict, optimized: dict, dedup_stats: dict):
         ("Free-form remediations (want 0)", naive["free_form_remediation_count"], optimized["free_form_remediation_count"]),
         ("False escalation rate", naive["false_escalation_rate"], optimized["false_escalation_rate"]),
         ("Human-review flagged", naive["human_review_flagged"], optimized["human_review_flagged"]),
-        ("p50 latency (s)", naive["p50_latency_s"], optimized["p50_latency_s"]),
-        ("p95 latency (s)", naive["p95_latency_s"], optimized["p95_latency_s"]),
+        ("p50 latency (s) [escalated]", naive["p50_latency_s"], optimized["p50_latency_s"]),
+        ("p95 latency (s) [escalated]", naive["p95_latency_s"], optimized["p95_latency_s"]),
         ("Total tokens", naive["total_tokens"], optimized["total_tokens"]),
         ("Total cost (USD)", naive["total_cost_usd"], optimized["total_cost_usd"]),
         ("Cost per task (USD)", naive["cost_per_task_usd"], optimized["cost_per_task_usd"]),
