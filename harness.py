@@ -73,30 +73,39 @@ CONFIDENCE_THRESHOLD = 0.6  # below this -> flagged for human review
 # Estimated token count of the fixed system prompt that every real call
 # pays on top of the actual log message.
 #
-# *** STALE — RECALIBRATE BEFORE TRUSTING COST NUMBERS ***
-# This value (3944) was calibrated against an EARLIER, SHORTER version of
-# lyzr_agent_config.json. Since then, agent_instructions grew (added an
-# explicit ROOT CAUSE TO CATEGORY MAPPING block + a 4th few-shot example
-# for NullPointerException), which adds real tokens to every call's fixed
-# overhead. Run `python harness.py --mode calibrate` against the CURRENT
-# agent with a real message, get the real llm_input_tokens from the
-# traces dashboard, and update this constant before trusting any
-# cost/token figures in the results table — right now they're a measured
-# UNDERESTIMATE relative to the actual current prompt size.
-PROMPT_OVERHEAD_TOKENS = 3843
+# Calibrated 2026-08-19 from 16 REAL traces pulled from Lyzr's traces-v2
+# dashboard (session_ids opt-E0016 ... opt-E0452 — one real metered call
+# per unique message in the current optimized run, i.e. full coverage of
+# all 16 distinct messages in track_a_logs.xlsx). For each trace, matched
+# session_id -> event_id -> the exact user_message string sent, encoded
+# it with tiktoken (cl100k_base), and solved
+#     implied_overhead = real_llm_input_tokens - tiktoken(user_message)
+# across all 16 points. Extremely tight: 3395-3398 tokens, std dev < 1
+# token. Take the median.
+#
+# The PREVIOUS constant here (3843) was not measured this way — it
+# overestimated the real fixed overhead by ~450 tokens/call.
+PROMPT_OVERHEAD_TOKENS = 3397
 
-# Pricing calibrated from REAL measured traces (not list-price guesses).
-# Solved as a linear system from 2 real gpt-5-mini traces (memory disabled):
-#   Call 1: "Hi"        → 3844 in / 348 out  → 0.017 credits
-#   Call 2: postgres msg → 3863 in / 466 out  → 0.019 credits
-# System: a*3844 + b*348 = 0.017
-#         a*3863 + b*466 = 0.019
-# Solution: a=0.0000029, b=0.0000165  (verified within ~0.5% on both points)
-# Note: old constants (0.000149 / 0.000682) were 41-51x too high because
-# they were calibrated against the memory-ENABLED agent and absorbed the
-# full memory-pipeline credit overhead into the per-token rates.
-CREDITS_PER_INPUT_TOKEN = 0.0000029
-CREDITS_PER_OUTPUT_TOKEN = 0.0000165
+# Pricing calibrated from the SAME 16 real traces above (each trace
+# carries llm_input_tokens, llm_output_tokens, and action_cost in
+# credits). Least-squares fit of credits = a*input + b*output across all
+# 16 points (numpy.linalg.lstsq, no intercept): fits to within 0.08% max
+# error on every point, so this is a well-determined system, not a
+# 2-point guess.
+#
+# The PREVIOUS constants here (0.0000029 / 0.0000165) were 36-52x too
+# LOW relative to these 16 real traces — meaning every dollar figure
+# computed with them (including anything already reported in
+# README.md / OPTIMIZATION_WRITEUP.md / SCOPING_MEMO.md) understated
+# real cost by roughly 45x. The previous comment block attributed those
+# small constants to "2 real gpt-5-mini traces," but the deployed agent
+# in payload.json runs gpt-4o-mini — that mismatch is itself a sign the
+# prior calibration wasn't actually run against this agent. Re-run
+# `--mode calibrate` (or repeat this trace-matching process) if
+# payload.json's agent_instructions or model changes again.
+CREDITS_PER_INPUT_TOKEN = 0.00015006
+CREDITS_PER_OUTPUT_TOKEN = 0.00059287
 # Lyzr's published self-serve rate is ~$10 per 1,000 credits. Not
 # independently confirmed against this specific account's exact billing
 # tier -- check the account's billing page before quoting exact dollar
@@ -261,7 +270,16 @@ async def call_lyzr_agent(service: str, severity: str, message: str,
                 + result.completion_tokens * CREDITS_PER_OUTPUT_TOKEN
             ) * USD_PER_CREDIT
 
-            _parse_verdict(raw_text, result)
+            try:
+                _parse_verdict(raw_text, result, severity)
+            except Exception as parse_err:  # noqa: BLE001 - a parsing bug is
+                # not a transient network fault; don't let it consume the
+                # retry budget or get logged as "failed after N attempts"
+                # (which would misattribute a parsing bug as a network
+                # failure). The HTTP call already succeeded at this point.
+                result.error = f"parse error (not retried): {parse_err}"
+                result.needs_human_review = True
+                result.schema_valid = False
             return result
 
         except Exception as e:  # noqa: BLE001 - want to retry on anything transient
@@ -276,7 +294,7 @@ async def call_lyzr_agent(service: str, severity: str, message: str,
     return result
 
 
-def _parse_verdict(raw_text: str, result: CallResult) -> None:
+def _parse_verdict(raw_text: str, result: CallResult, severity: str | None = None) -> None:
     """Parses + validates the model's JSON output against the closed-set
     contract. This is the ONLY enforcement mechanism now — there is no
     platform-level response_format/JSON-schema (removed after a real
@@ -309,12 +327,35 @@ def _parse_verdict(raw_text: str, result: CallResult) -> None:
         result.schema_valid = False
         return
 
+    if not isinstance(verdict, dict):
+        result.error = "parsed JSON was not an object"
+        result.needs_human_review = True
+        result.schema_valid = False
+        return
+
     result.is_incident = verdict.get("is_incident")
     result.category = verdict.get("category")
     result.root_cause = verdict.get("root_cause")
     result.remediation = verdict.get("remediation")
     result.confidence = verdict.get("confidence")
     result.reasoning = verdict.get("reasoning", "")
+
+    # Defensive type coercion. The module docstring documents a REAL prior
+    # incident where Lyzr's platform silently swapped in an incompatible
+    # fallback model mid-request — a model that returns "true"/"false" as
+    # strings instead of JSON booleans would otherwise pass a strict
+    # `is True` check straight through as False, silently reclassifying a
+    # real incident as noise with no error and no flag anywhere downstream.
+    # Same idea for confidence: a numeric string would crash the `<`
+    # comparison below rather than fail loudly as a schema violation.
+    if isinstance(result.is_incident, str):
+        result.is_incident = result.is_incident.strip().lower() == "true"
+    if result.confidence is not None and not isinstance(result.confidence, (int, float)):
+        try:
+            result.confidence = float(result.confidence)
+        except (TypeError, ValueError):
+            result.schema_valid = False
+            result.confidence = None
 
     # Closed-set validation — this is what "0 free-form remediations"
     # actually means in code, not just in the prompt. This is now the
@@ -350,6 +391,19 @@ def _parse_verdict(raw_text: str, result: CallResult) -> None:
 
     if result.confidence is None or result.confidence < CONFIDENCE_THRESHOLD:
         result.needs_human_review = True
+
+    # Hard code-level severity gate (not just a prompt instruction):
+    # ERROR/CRITICAL logs can never be fast-pathed as noise, no matter
+    # what the model decides. This is what makes "strict severity
+    # gating" in the scoping memo an actual guarantee instead of a hope
+    # that the model followed the prompt.
+    if severity in ("ERROR", "CRITICAL") and result.is_incident is False:
+        result.is_incident = True
+        result.needs_human_review = True
+        result.reasoning += (
+            f" [severity gate: {severity} cannot be classified as noise; "
+            f"overridden and routed to human review]"
+        )
 
 
 # ---------------------------------------------------------------------------

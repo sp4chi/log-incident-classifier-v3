@@ -1,90 +1,74 @@
-# Lyzr Take-Home Assignment — Track A: Auto-Remediation from Logs
+# Lyzr Take-Home — Track A: Auto-Remediation from Logs
 
-Autonomous SRE log triage, noise filtering, and closed-set remediation agent built on **Lyzr Agent Studio**.
+Autonomous SRE log triage and closed-set remediation agent, built on Lyzr Agent Studio and driven over its API by `harness.py`.
 
----
+## Results (full 455-event dataset, both passes call the same live agent)
 
-## 🏆 Key Measured Results
+| Metric | Target | Naive (455 calls) | Optimized (16 calls) |
+|---|---|---|---|
+| Category macro-F1 (40 labeled) | ≥ 0.85 | 1.00 | 1.00 |
+| Root-cause macro-F1 (40 labeled) | ≥ 0.80 | 1.00 | 1.00 |
+| Free-form remediations | 0 | 0 | 0 |
+| False escalation rate | report | 0.0% | 0.0% |
+| p50 latency, escalated events | report | 3.68s | 4.08s |
+| p95 latency, escalated events | ≤ 4.0s | 5.27s | 3.9–4.6s (see note) |
+| Total tokens | report | 1,579,688 | 55,592 |
+| Total cost (est.) | report | $2.48 | $0.087 |
+| Cost per task | report | $0.00544 | $0.00019 |
+| Cost reduction vs. naive | ≥ 50% | — | 96.5% (28.3×) |
+| Wall clock, full batch | report | 424s | 15–32s |
+| Throughput | report | 64 tasks/min | 866–1844 tasks/min |
 
-| Metric | Target / Requirement | Measured (Optimized Build) | Result |
-|---|:---:|:---:|:---:|
-| **Scale** | Process full 455-event batch | **455 events covered** | ✅ Pass |
-| **Category Macro-F1** | $\ge 0.85$ | **1.0000** | ✅ Pass (100%) |
-| **Root-Cause Macro-F1** | $\ge 0.80$ | **1.0000** | ✅ Pass (100%) |
-| **Free-Form Remediations** | **0** (Strict closed-set) | **0** | ✅ Pass |
-| **False Escalation Rate** | Low / Report | **0.0%** (All noise filtered) | ✅ Pass |
-| **p95 Latency (Escalated)** | $\le 4.0\text{s}$ | **3.911s** (`MAX_TASK=2`) | ✅ Pass |
-| **Cost Reduction vs. Naive** | $\ge 50\%$ | **96.5% cost reduction** (29.9×) | ✅ Pass |
-| **Throughput** | Report (events/min) | **977.9 tasks/min** | ✅ Pass |
+**p95 latency note**: the optimized pass only makes 16 real calls (one per unique message), so p95 is the 2nd-worst of 16 samples — a small, noisy statistic. Three repeated runs at the same settings measured 3.91s, 4.34s, and 4.65s. Treat this as "around the 4s line," not a precise number; the naive pass's p95 (5.27s, n=455) is the statistically solid measurement, and it doesn't gate the SLO since the optimized path is what ships.
 
----
+**Token/cost figures are estimates**: Lyzr's `/v3/inference/chat/` response carries no usage block, so every token/cost number above comes from a local estimate calibrated against 16 real metered traces pulled from the Studio traces dashboard (see the calibration comment block at the top of `harness.py`). The naive-vs-optimized *delta* is solid regardless (it's driven by the 455→16 call ratio), the absolute dollar figures are calibrated estimates.
 
-## 📁 Repository Structure & Deliverables
+## Repository
 
-* [`SCOPING_MEMO.md`](file:///Users/kaushikgohainbora/Desktop/lyzr.ai/SCOPING_MEMO.md): **Part 1 — Client Scoping Memo** (Executive framing, risks, 4-way trade-offs, 2-week engagement roadmap).
-* [`OPTIMIZATION_WRITEUP.md`](file:///Users/kaushikgohainbora/Desktop/lyzr.ai/OPTIMIZATION_WRITEUP.md): **Part 2 & 3 — Optimization Write-Up & Moving-Target Analysis** (Deep-dive on the 4 optimization levers, side-by-side benchmark table, feature audit, budget/latency pivot plans).
-* [`harness.py`](file:///Users/kaushikgohainbora/Desktop/lyzr.ai/harness.py): The async benchmark harness driving Lyzr Agent Studio over API with automated scoring against ground-truth datasets.
-* [`payload.json`](file:///Users/kaushikgohainbora/Desktop/lyzr.ai/payload.json): Complete agent configuration schema (instructions, few-shot examples, closed-set mapping, model settings).
-* [`requirements.txt`](file:///Users/kaushikgohainbora/Desktop/lyzr.ai/requirements.txt): Minimal Python dependencies (`httpx`, `pandas`, `openpyxl`, `python-dotenv`, `scikit-learn`, `tiktoken`).
+- [`SCOPING_MEMO.md`](SCOPING_MEMO.md) — Part 1, client-facing scoping note.
+- [`OPTIMIZATION_WRITEUP.md`](OPTIMIZATION_WRITEUP.md) — Part 2/3, levers pulled + moving-target analysis.
+- [`harness.py`](harness.py) — the benchmark harness (naive baseline, optimized/dedup build, metrics, calibration).
+- [`payload.json`](payload.json) — the deployed agent's config (instructions, few-shot examples, model settings), kept in sync with what's live on Studio.
+- [`track_a_logs.xlsx`](track_a_logs.xlsx) — the provided dataset.
 
----
+## Running it
 
-## 🚀 Quickstart & Reproduction Guide
-
-### 1. Prerequisites & Setup
 ```bash
-# Clone repository and enter directory
-cd lyzr.ai
-
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Environment Variables
-Create a `.env` file in the root directory:
-```bash
-LYZR_API_KEY="your-lyzr-api-key"
-LYZR_AGENT_ID="your-agent-id"
-LYZR_USER_ID="your-email@example.com"
+`.env`:
+```
+LYZR_API_KEY=...
+LYZR_AGENT_ID=...
+LYZR_USER_ID=...
 ```
 
-### 3. Running the Benchmark Harness
-
-#### Run Optimized Build (Fast & Cost-Efficient — 16 unique calls):
 ```bash
-python harness.py --data track_a_logs.xlsx --mode optimized --max-tasks 2
-```
-
-#### Run Naive Baseline (Unoptimized — 455 separate calls):
-```bash
-python harness.py --data track_a_logs.xlsx --mode naive --max-tasks 2
-```
-
-#### Run Full Benchmark (Generates Side-by-Side Table & Summary JSON):
-```bash
+# both passes, regenerates the results table + CSVs + summary.json
 python harness.py --data track_a_logs.xlsx --mode both --max-tasks 2 --out-prefix results_final
-```
 
-#### Interactive Calibration Check (Validates local token/cost model against real Lyzr trace):
-```bash
+# either pass alone
+python harness.py --data track_a_logs.xlsx --mode naive
+python harness.py --data track_a_logs.xlsx --mode optimized --max-tasks 2
+
+# recalibrate the token/cost constants against a real Studio trace
 python harness.py --mode calibrate
 ```
 
----
+## What's actually enabled on Studio, and why
 
-## 🛠️ The 4 Core Optimization Levers
+| Feature | On? | Why |
+|---|---|---|
+| Conversational memory (`store_messages`) | Off | Triage is stateless — one log line in, one verdict out. Memory would add tokens and latency for no benefit here. |
+| 4 few-shot examples | On | Anchors the model to the exact closed-set strings (`payload.json`'s `examples` field) — the two taxonomy entries with a worked example are the two the model reproduces most reliably verbatim. |
+| Platform JSON-schema / `response_format` | Off, deliberately | Removed after a real incident: Lyzr's routing silently fell back to an incompatible model mid-batch, and its structured-output implementation couldn't accept the schema — every call 400'd. Enforcement now happens via prompt instructions + code-side validation in `harness.py` (`ALLOWED_CATEGORIES`/`ALLOWED_ROOT_CAUSES`/`ALLOWED_REMEDIATIONS`), which degrades to "flag for human review" instead of "pipeline down" when the model drifts. |
+| Multi-provider fallback | On (configured in Studio) | Protects against the exact failure mode above recurring as a hard outage. Not yet re-exported into `payload.json` as a checkable artifact — flagging that as a to-do, not overstating it as fully documented. |
 
-1. **In-Memory / Distributed Deduplication**:
-   * Clusters 455 raw log lines into 16 unique signatures before calling the LLM.
-   * Fanned verdicts back out in $O(1)$ time ($<1\mu\text{s}$), cutting API calls, tokens, and billing by **96.5%**.
-2. **Stateless Memory Elimination (`store_messages: false`)**:
-   * Stripped the 8-span conversational memory pipeline on Lyzr Studio, reducing latency by **34%** and eliminating redundant credit charges.
-3. **Deterministic Code Guards & Cross-Field Derivation**:
-   * Mapped `root_cause` $\to$ `category` deterministically in code post-processing.
-   * Eliminates LLM classification drift and guarantees **0 free-form remediations**.
-4. **Asyncio Keep-Alive Connection Pooling (`MAX_TASK=2`)**:
-   * Lightweight `asyncio.Semaphore` with `httpx.AsyncClient` keeps connection reuse high while eliminating upstream provider queue spikes, bringing **p95 latency to 3.91s**.
+## Known limitations, stated plainly
+
+- Token/cost numbers are estimates calibrated from real traces, not metered API numbers (Lyzr doesn't return a usage block).
+- `false_escalation_rate` is scored against the 40 labeled events; it assumes every message outside that set is noise, which holds for this specific 16-unique-message corpus but isn't a general guarantee.
+- `category` is derived deterministically from `root_cause` in post-processing, so its F1 tracks root-cause F1 by construction — it isn't an independently-earned model score.
+- Optimized-pass p95 is measured on only 16 calls; see the note in the results table.
