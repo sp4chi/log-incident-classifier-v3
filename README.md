@@ -31,6 +31,16 @@ Autonomous SRE log triage and closed-set remediation agent, built on Lyzr Agent 
 - [`payload.json`](payload.json) — the deployed agent's config (instructions, few-shot examples, model settings), kept in sync with what's live on Studio.
 - [`track_a_logs.xlsx`](track_a_logs.xlsx) — the provided dataset.
 
+## Incident flow
+
+Pipeline: raw logs → dedup → LLM verdict → validation gates → routed outcome.
+
+![Incident classification pipeline](incident_classification_pipeline.png)
+
+Worked examples of the routing decision:
+
+![Real example routing](real_example_routing.png)
+
 ## Running it
 
 ```bash
